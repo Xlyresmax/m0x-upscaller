@@ -1,0 +1,20 @@
+{
+  "name": "m0x-upscaller",
+  "version": "1.0.0",
+  "description": "DLSS 5 Video & Picture Neural Upscaler Studio",
+  "private": true,
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri",
+    "start": "Launch-Studio.bat",
+    "start:ui": "npm run start --prefix ui",
+    "dev:ui": "npm run dev --prefix ui",
+    "build:ui": "npm run build --prefix ui",
+    "build:cpp": "cmake --build build --config Release",
+    "build:release": "npm run build:ui && npm run build:cpp && cargo build --release --manifest-path src-tauri/Cargo.toml"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0"
+  }
+}
