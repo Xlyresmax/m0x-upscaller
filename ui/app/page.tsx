@@ -34,7 +34,12 @@ import {
   Image as ImageIcon,
   Plus,
   X,
-  FolderUp
+  FolderUp,
+  Folder,
+  FolderOpen,
+  Copy,
+  Check,
+  ExternalLink
 } from 'lucide-react';
 
 type ContentPresetId = 'screen' | 'camera' | 'gameplay' | 'restore';
@@ -90,7 +95,33 @@ export default function App() {
   const [videoResolution, setVideoResolution] = useState<{ width: number; height: number }>({ width: 1920, height: 1080 });
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [selectedEncoder, setSelectedEncoder] = useState<'hevc_nvenc' | 'av1_nvenc' | 'h264_nvenc'>('hevc_nvenc');
-  const [exportResult, setExportResult] = useState<{ filename: string; downloadUrl: string; outputPath: string; mediaType?: 'video' | 'image' } | null>(null);
+  const [exportResult, setExportResult] = useState<{
+    filename: string;
+    downloadUrl: string;
+    outputPath: string;
+    destinationFolder?: string;
+    mediaType?: 'video' | 'image';
+    fileSizeBytes?: number;
+  } | null>(null);
+
+  // User Export Destination State
+  const [showExportModal, setShowExportModal] = useState<boolean>(false);
+  const [exportFolder, setExportFolder] = useState<string>('');
+  const [exportFileName, setExportFileName] = useState<string>('');
+  const [isBrowsingFolder, setIsBrowsingFolder] = useState<boolean>(false);
+  const [isOpeningFile, setIsOpeningFile] = useState<boolean>(false);
+  const [copiedPath, setCopiedPath] = useState<boolean>(false);
+  const [presetFolders, setPresetFolders] = useState<{
+    videos: string;
+    desktop: string;
+    downloads: string;
+    outputs: string;
+  }>({
+    videos: '',
+    desktop: '',
+    downloads: '',
+    outputs: '',
+  });
   const [hardwareTelemetry, setHardwareTelemetry] = useState<{
     adapter: string;
     dedicatedVramMb: number;
@@ -890,6 +921,24 @@ export default function App() {
       .catch(() => {});
   }, []);
 
+  // Fetch OS default export folders
+  useEffect(() => {
+    fetch('/api/export-location/defaults')
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.status === 'ok') {
+          setPresetFolders({
+            videos: data.videos || '',
+            desktop: data.desktop || '',
+            downloads: data.downloads || '',
+            outputs: data.outputs || '',
+          });
+          setExportFolder(data.defaultFolder || data.videos || data.outputs || '');
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     refreshTelemetry();
   }, [refreshTelemetry]);
@@ -903,6 +952,19 @@ export default function App() {
       videoRef.current.pause();
     }
   }, [isPlaying]);
+
+  // Auto-promote encoder to HEVC NVENC if target resolution exceeds 4096px
+  useEffect(() => {
+    if (mediaType === 'video') {
+      const targetW = (videoResolution?.width || 1920) * settings.upscaleFactor;
+      const targetH = (videoResolution?.height || 1080) * settings.upscaleFactor;
+      if (targetW > 4096 || targetH > 4096) {
+        if (selectedEncoder === 'h264_nvenc') {
+          setSelectedEncoder('hevc_nvenc');
+        }
+      }
+    }
+  }, [videoResolution, settings.upscaleFactor, mediaType, selectedEncoder]);
 
   const processUploadedFile = async (file: File) => {
     try {
@@ -1005,8 +1067,89 @@ export default function App() {
     showToast('Media removed. Ready to add a new video or picture.');
   };
 
-  const handleStartBatchExport = async () => {
+  const handleOpenExportDialog = () => {
+    if (!hasMedia && !videoSrc && !imageSrc) {
+      showToast('Please add a video or picture first before exporting.');
+      return;
+    }
+
+    const isImg = mediaType === 'image';
+    const cleanBase = videoFileName
+      ? videoFileName.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9._-]/g, '_')
+      : isImg
+      ? 'picture'
+      : 'video';
+    const ext = isImg ? (imageSrc.includes('.png') ? '.png' : '.jpg') : '.mp4';
+    const suggested = `enhanced_${cleanBase}_${settings.upscaleFactor}x_${settings.dlss5Style.toLowerCase()}${ext}`;
+
+    setExportFileName(suggested);
+    if (!exportFolder) {
+      setExportFolder(presetFolders.videos || presetFolders.outputs || '');
+    }
+    setShowExportModal(true);
+  };
+
+  const handleBrowseFolder = async () => {
     try {
+      setIsBrowsingFolder(true);
+      showToast('Opening Windows Folder Dialog...');
+      const res = await fetch('/api/export-location/browse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initialDir: exportFolder || presetFolders.videos }),
+      });
+      const data = await res.json();
+      if (data.status === 'ok' && data.folder) {
+        setExportFolder(data.folder);
+        showToast(`Selected destination: ${data.folder}`);
+      }
+    } catch {
+      showToast('Failed to open native Windows folder picker');
+    } finally {
+      setIsBrowsingFolder(false);
+    }
+  };
+
+  const handleOpenFile = async (action: 'open' | 'reveal') => {
+    if (!exportResult?.outputPath) return;
+    try {
+      setIsOpeningFile(true);
+      const res = await fetch('/api/open-file', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: exportResult.outputPath, action }),
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        showToast(
+          action === 'reveal'
+            ? 'Opened folder with exported file in Windows Explorer'
+            : 'Opened video in default media player'
+        );
+      } else {
+        showToast(`Action failed: ${data.error || 'Could not open file'}`);
+      }
+    } catch {
+      showToast('Failed to open file on system');
+    } finally {
+      setIsOpeningFile(false);
+    }
+  };
+
+  const handleCopyExportPath = () => {
+    if (!exportResult?.outputPath) return;
+    navigator.clipboard.writeText(exportResult.outputPath);
+    setCopiedPath(true);
+    showToast('Copied full export path to clipboard!');
+    setTimeout(() => setCopiedPath(false), 2200);
+  };
+
+  const handleStartBatchExport = async (targetFolder?: string, targetName?: string) => {
+    setShowExportModal(false);
+    try {
+      const folderToUse = targetFolder || exportFolder || presetFolders.outputs || '';
+      const fileToUse = targetName || exportFileName || `upscaled_video_${Date.now()}.mp4`;
+
       setExportProgress(10);
       setExportResult(null);
       const isImg = mediaType === 'image';
@@ -1037,6 +1180,9 @@ export default function App() {
           deblock: settings.deblockCompression,
           frameGen: !isImg && (pipelineCards.find((c) => c.id === 'framegen')?.enabled ?? false),
           fpsMultiplier: settings.frameGenMultiplier,
+          destinationFolder: folderToUse,
+          destinationFileName: fileToUse,
+          videoResolution: videoResolution,
         }),
       });
 
@@ -1049,12 +1195,14 @@ export default function App() {
           filename: data.filename,
           downloadUrl: data.downloadUrl,
           outputPath: data.outputPath,
+          destinationFolder: data.destinationFolder,
           mediaType: data.mediaType || (isImg ? 'image' : 'video'),
+          fileSizeBytes: data.fileSizeBytes,
         });
         showToast(
           isImg
-            ? `Picture DLSS 5 Upscale Complete! Saved to outputs/${data.filename}`
-            : `Hardware NVENC Upscale Complete! Saved to outputs/${data.filename}`
+            ? `Picture DLSS 5 Upscale Complete! Saved to: ${data.outputPath}`
+            : `Hardware NVENC Upscale Complete! Saved to: ${data.outputPath}`
         );
       } else {
         setExportProgress(null);
@@ -2268,9 +2416,16 @@ export default function App() {
                           isDark ? 'bg-slate-900 border-slate-700 text-slate-200' : 'bg-white border-slate-300 text-slate-800'
                         }`}
                       >
-                        <option value="hevc_nvenc">HEVC NVENC 10-bit</option>
-                        <option value="av1_nvenc">AV1 NVENC (RTX 5080)</option>
-                        <option value="h264_nvenc">H.264 NVENC Max Compat</option>
+                        <option value="hevc_nvenc">HEVC NVENC 10-bit (Up to 8K UHD)</option>
+                        <option value="av1_nvenc">AV1 NVENC (RTX 5080 8K)</option>
+                        <option
+                          value="h264_nvenc"
+                          disabled={videoResolution.width * settings.upscaleFactor > 4096 || videoResolution.height * settings.upscaleFactor > 4096}
+                        >
+                          {videoResolution.width * settings.upscaleFactor > 4096
+                            ? 'H.264 (Disabled: >4096px - Use HEVC)'
+                            : 'H.264 NVENC Max Compat'}
+                        </option>
                       </select>
                     )}
                   </div>
@@ -2278,7 +2433,7 @@ export default function App() {
 
                 <button
                   type="button"
-                  onClick={handleStartBatchExport}
+                  onClick={handleOpenExportDialog}
                   disabled={exportProgress !== null && exportProgress < 100}
                   className="w-full py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:brightness-110 disabled:opacity-50 text-white font-bold text-xs flex items-center justify-center gap-2 shadow-lg shadow-cyan-500/20 transition-all cursor-pointer"
                 >
@@ -2310,25 +2465,78 @@ export default function App() {
                 )}
 
                 {exportResult && (
-                  <div className={`p-3 border rounded-xl flex flex-col gap-2 ${
-                    isDark ? 'bg-emerald-950/40 border-emerald-500/40' : 'bg-emerald-50 border-emerald-300'
+                  <div className={`p-3.5 border rounded-xl flex flex-col gap-2.5 shadow-lg ${
+                    isDark ? 'bg-emerald-950/30 border-emerald-500/40 text-slate-100' : 'bg-emerald-50/80 border-emerald-300 text-slate-900'
                   }`}>
-                    <div className={`flex items-center gap-1.5 text-xs font-semibold ${isDark ? 'text-emerald-300' : 'text-emerald-800'}`}>
-                      <CheckCircle2 className="w-4 h-4 text-emerald-500" />
-                      <span>{exportResult.mediaType === 'image' ? 'Picture Upscale Complete!' : 'Video Upscale Complete!'}</span>
+                    <div className="flex items-center justify-between">
+                      <div className={`flex items-center gap-1.5 text-xs font-bold ${isDark ? 'text-emerald-300' : 'text-emerald-800'}`}>
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span>{exportResult.mediaType === 'image' ? 'Picture Upscale Complete!' : 'Video Upscale Complete!'}</span>
+                      </div>
+                      {exportResult.fileSizeBytes && exportResult.fileSizeBytes > 0 && (
+                        <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
+                          isDark ? 'bg-emerald-900/40 border-emerald-700 text-emerald-300' : 'bg-emerald-100 border-emerald-300 text-emerald-800'
+                        }`}>
+                          {(exportResult.fileSizeBytes / (1024 * 1024)).toFixed(2)} MB
+                        </span>
+                      )}
                     </div>
-                    <div className={`text-[11px] font-mono truncate ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
-                      File: {exportResult.filename}
+
+                    <div className={`p-2 rounded-lg border font-mono text-[11px] ${
+                      isDark ? 'bg-slate-950/90 border-slate-800' : 'bg-white border-slate-200'
+                    }`}>
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1">
+                        <span>Exported Location:</span>
+                        <button
+                          type="button"
+                          onClick={handleCopyExportPath}
+                          className="flex items-center gap-1 text-cyan-400 hover:text-cyan-300 transition-colors cursor-pointer"
+                        >
+                          {copiedPath ? (
+                            <>
+                              <Check className="w-3 h-3 text-emerald-400" />
+                              <span className="text-emerald-400">Copied!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3 h-3" />
+                              <span>Copy Path</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                      <div className="text-cyan-300 break-all select-all font-semibold">
+                        {exportResult.outputPath}
+                      </div>
                     </div>
-                    <div className="grid grid-cols-2 gap-2 mt-1">
-                      <a
-                        href={exportResult.downloadUrl}
-                        download={exportResult.filename}
-                        className="py-1.5 px-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-lg text-xs font-bold text-center flex items-center justify-center gap-1 transition-all"
+
+                    <div className="grid grid-cols-2 gap-2 mt-0.5">
+                      <button
+                        type="button"
+                        onClick={() => handleOpenFile('open')}
+                        disabled={isOpeningFile}
+                        className="py-2 px-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:brightness-110 text-white rounded-lg text-xs font-bold text-center flex items-center justify-center gap-1.5 shadow-md shadow-emerald-500/20 transition-all cursor-pointer"
+                        title="Open video in Windows default media player"
                       >
-                        <Download className="w-3.5 h-3.5" />
-                        Download {exportResult.mediaType === 'image' ? 'Image' : 'MP4'}
-                      </a>
+                        <Play className="w-3.5 h-3.5 fill-current" />
+                        <span>Open Video</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleOpenFile('reveal')}
+                        disabled={isOpeningFile}
+                        className={`py-2 px-2.5 border rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                          isDark
+                            ? 'bg-slate-800/90 hover:bg-slate-800 text-slate-200 border-slate-700 hover:border-slate-600'
+                            : 'bg-white hover:bg-slate-50 text-slate-800 border-slate-300 shadow-sm'
+                        }`}
+                        title="Reveal video in Windows Explorer"
+                      >
+                        <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Show in Folder</span>
+                      </button>
+
                       <button
                         type="button"
                         onClick={() => {
@@ -2349,19 +2557,262 @@ export default function App() {
                             }
                           }
                         }}
-                        className={`py-1.5 px-2 border rounded-lg text-xs font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer ${
+                        className={`py-2 px-2.5 border rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
                           isDark
-                            ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
-                            : 'bg-white hover:bg-slate-50 text-slate-800 border-slate-300'
+                            ? 'bg-slate-800/90 hover:bg-slate-800 text-slate-200 border-slate-700 hover:border-slate-600'
+                            : 'bg-white hover:bg-slate-50 text-slate-800 border-slate-300 shadow-sm'
                         }`}
+                        title="Watch upscaled video inside Studio viewport"
                       >
-                        <Eye className="w-3.5 h-3.5 text-cyan-500" />
-                        {exportResult.mediaType === 'image' ? 'View in Viewport' : 'Play in Viewport'}
+                        <Eye className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Play in Studio</span>
                       </button>
+
+                      <a
+                        href={exportResult.downloadUrl}
+                        download={exportResult.filename}
+                        className={`py-2 px-2.5 border rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-all text-center ${
+                          isDark
+                            ? 'bg-slate-800/90 hover:bg-slate-800 text-slate-200 border-slate-700 hover:border-slate-600'
+                            : 'bg-white hover:bg-slate-50 text-slate-800 border-slate-300 shadow-sm'
+                        }`}
+                        title="Download file to browser"
+                      >
+                        <Download className="w-3.5 h-3.5 text-blue-400" />
+                        <span>Download</span>
+                      </a>
                     </div>
                   </div>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Export Destination Modal Dialog */}
+      {showExportModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-200">
+          <div className={`w-full max-w-xl rounded-2xl border shadow-2xl overflow-hidden flex flex-col transition-all ${
+            isDark ? 'bg-slate-900 border-cyan-500/30 text-white' : 'bg-white border-slate-300 text-slate-900'
+          }`}>
+            {/* Modal Header */}
+            <div className={`px-6 py-4 border-b flex items-center justify-between ${
+              isDark ? 'border-slate-800 bg-slate-950/70' : 'border-slate-200 bg-slate-50'
+            }`}>
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center shadow-md shadow-cyan-500/25">
+                  <FolderUp className="w-5 h-5 text-white" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold tracking-tight">
+                    Export {mediaType === 'image' ? 'Picture' : 'Video'} Destination
+                  </h3>
+                  <p className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                    Choose where to save the enhanced {settings.upscaleFactor}x {mediaType} on your PC
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowExportModal(false)}
+                className={`p-1.5 rounded-lg border transition-all cursor-pointer ${
+                  isDark ? 'hover:bg-slate-800 border-slate-700 text-slate-400 hover:text-white' : 'hover:bg-slate-100 border-slate-200 text-slate-500'
+                }`}
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-6 space-y-4">
+              {/* Destination Folder Selector */}
+              <div>
+                <label className={`block text-xs font-semibold uppercase tracking-wider mb-2 ${
+                  isDark ? 'text-slate-300' : 'text-slate-700'
+                }`}>
+                  1. Destination Folder
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={exportFolder}
+                    onChange={(e) => setExportFolder(e.target.value)}
+                    placeholder="e.g. C:\Users\ayush\Videos"
+                    className={`w-full font-mono text-xs rounded-xl px-3 py-2.5 border focus:outline-none focus:ring-2 focus:ring-cyan-500 transition-all ${
+                      isDark ? 'bg-slate-950 border-slate-700 text-cyan-300' : 'bg-slate-50 border-slate-300 text-slate-900'
+                    }`}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleBrowseFolder}
+                    disabled={isBrowsingFolder}
+                    className="px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-bold text-xs flex items-center gap-1.5 shadow-md shadow-cyan-500/20 transition-all cursor-pointer whitespace-nowrap"
+                    title="Open native Windows Folder Picker"
+                  >
+                    <FolderOpen className="w-4 h-4" />
+                    <span>{isBrowsingFolder ? 'Selecting...' : 'Browse...'}</span>
+                  </button>
+                </div>
+
+                {/* Quick Presets */}
+                <div className="flex items-center gap-1.5 mt-2 flex-wrap text-xs">
+                  <span className={`text-[11px] font-medium mr-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                    Quick Select:
+                  </span>
+                  {presetFolders.videos && (
+                    <button
+                      type="button"
+                      onClick={() => setExportFolder(presetFolders.videos)}
+                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-medium transition-all cursor-pointer flex items-center gap-1 ${
+                        exportFolder === presetFolders.videos
+                          ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 font-semibold'
+                          : isDark
+                          ? 'bg-slate-800/80 hover:bg-slate-800 border-slate-700 text-slate-300'
+                          : 'bg-slate-100 hover:bg-slate-200 border-slate-300 text-slate-700'
+                      }`}
+                    >
+                      <Film className="w-3 h-3 text-cyan-400" />
+                      Videos
+                    </button>
+                  )}
+                  {presetFolders.desktop && (
+                    <button
+                      type="button"
+                      onClick={() => setExportFolder(presetFolders.desktop)}
+                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-medium transition-all cursor-pointer flex items-center gap-1 ${
+                        exportFolder === presetFolders.desktop
+                          ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 font-semibold'
+                          : isDark
+                          ? 'bg-slate-800/80 hover:bg-slate-800 border-slate-700 text-slate-300'
+                          : 'bg-slate-100 hover:bg-slate-200 border-slate-300 text-slate-700'
+                      }`}
+                    >
+                      <Monitor className="w-3 h-3 text-cyan-400" />
+                      Desktop
+                    </button>
+                  )}
+                  {presetFolders.downloads && (
+                    <button
+                      type="button"
+                      onClick={() => setExportFolder(presetFolders.downloads)}
+                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-medium transition-all cursor-pointer flex items-center gap-1 ${
+                        exportFolder === presetFolders.downloads
+                          ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 font-semibold'
+                          : isDark
+                          ? 'bg-slate-800/80 hover:bg-slate-800 border-slate-700 text-slate-300'
+                          : 'bg-slate-100 hover:bg-slate-200 border-slate-300 text-slate-700'
+                      }`}
+                    >
+                      <Download className="w-3 h-3 text-cyan-400" />
+                      Downloads
+                    </button>
+                  )}
+                  {presetFolders.outputs && (
+                    <button
+                      type="button"
+                      onClick={() => setExportFolder(presetFolders.outputs)}
+                      className={`px-2.5 py-1 rounded-lg border text-[11px] font-medium transition-all cursor-pointer flex items-center gap-1 ${
+                        exportFolder === presetFolders.outputs
+                          ? 'bg-cyan-500/20 border-cyan-400 text-cyan-300 font-semibold'
+                          : isDark
+                          ? 'bg-slate-800/80 hover:bg-slate-800 border-slate-700 text-slate-300'
+                          : 'bg-slate-100 hover:bg-slate-200 border-slate-300 text-slate-700'
+                      }`}
+                    >
+                      <Folder className="w-3 h-3 text-cyan-400" />
+                      Studio Outputs
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Output File Name */}
+              <div>
+                <label className={`block text-xs font-semibold uppercase tracking-wider mb-2 ${
+                  isDark ? 'text-slate-300' : 'text-slate-700'
+                }`}>
+                  2. Output File Name
+                </label>
+                <input
+                  type="text"
+                  value={exportFileName}
+                  onChange={(e) => setExportFileName(e.target.value)}
+                  placeholder={mediaType === 'image' ? 'enhanced_image.png' : 'enhanced_video.mp4'}
+                  className={`w-full font-mono text-xs rounded-xl px-3 py-2.5 border focus:outline-none focus:ring-2 focus:ring-cyan-500 transition-all ${
+                    isDark ? 'bg-slate-950 border-slate-700 text-slate-100' : 'bg-slate-50 border-slate-300 text-slate-900'
+                  }`}
+                />
+              </div>
+
+              {/* Full Destination Path Preview */}
+              <div className={`p-3 rounded-xl border ${
+                isDark ? 'bg-slate-950/80 border-slate-800' : 'bg-slate-100 border-slate-200'
+              }`}>
+                <div className="flex items-center justify-between text-[11px] font-medium mb-1">
+                  <span className={isDark ? 'text-slate-400' : 'text-slate-500'}>Full Destination Path:</span>
+                  <span className="text-emerald-400 font-mono text-[10px] flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    Path Ready
+                  </span>
+                </div>
+                <div className="font-mono text-xs text-cyan-300 break-all select-all font-semibold">
+                  {exportFolder ? `${exportFolder.replace(/[\\/]$/, '')}\\${exportFileName}` : exportFileName}
+                </div>
+              </div>
+
+              {/* Quality & Hardware Details Badge */}
+              <div className={`grid grid-cols-3 gap-2 p-3 rounded-xl border text-center text-xs ${
+                isDark ? 'bg-slate-950/50 border-slate-800/80' : 'bg-slate-50 border-slate-200'
+              }`}>
+                <div>
+                  <div className={`text-[10px] uppercase font-bold ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>Target Res</div>
+                  <div className="font-semibold text-cyan-400 mt-0.5">
+                    {mediaType === 'image'
+                      ? `${settings.upscaleFactor}x Image`
+                      : `${videoResolution.width * settings.upscaleFactor}x${videoResolution.height * settings.upscaleFactor} (${settings.upscaleFactor}x)`}
+                  </div>
+                </div>
+                <div>
+                  <div className={`text-[10px] uppercase font-bold ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>Encoder</div>
+                  <div className="font-semibold text-emerald-400 mt-0.5">
+                    {mediaType === 'image'
+                      ? 'Lanczos Neural'
+                      : videoResolution.width * settings.upscaleFactor > 4096
+                      ? 'HEVC NVENC (8K UHD)'
+                      : selectedEncoder.split('_')[0].toUpperCase() + ' NVENC'}
+                  </div>
+                </div>
+                <div>
+                  <div className={`text-[10px] uppercase font-bold ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>DLSS 5 Style</div>
+                  <div className="font-semibold text-blue-400 mt-0.5">{settings.dlss5Style}</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className={`px-6 py-4 border-t flex items-center justify-end gap-3 ${
+              isDark ? 'border-slate-800 bg-slate-950/70' : 'border-slate-200 bg-slate-50'
+            }`}>
+              <button
+                type="button"
+                onClick={() => setShowExportModal(false)}
+                className={`px-4 py-2 rounded-xl text-xs font-semibold border transition-all cursor-pointer ${
+                  isDark
+                    ? 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+                    : 'bg-white hover:bg-slate-100 border-slate-300 text-slate-700'
+                }`}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => handleStartBatchExport(exportFolder, exportFileName)}
+                className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 via-teal-500 to-blue-600 hover:brightness-110 text-white font-bold text-xs flex items-center gap-2 shadow-lg shadow-cyan-500/25 transition-all cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                <span>Confirm & Export Video</span>
+              </button>
             </div>
           </div>
         </div>
